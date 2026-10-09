@@ -4,6 +4,10 @@
 
 > Layered compaction-threshold manager for DeepSeek Harness. Precedence: global → context-window tier → model. Configure it from a sidebar page and see every model's resolved threshold live.
 
+![不幸被官方机制压缩到只有四分之一的 K3-256K](kimi-quarter.jpg)
+
+*不幸被官方机制压缩到只有四分之一的 K3-256K，本仓库的设计缘由。*
+
 ---
 
 ## 为什么需要它
@@ -38,17 +42,20 @@ floor(min(W × 0.8, W − O − 65536))
 2. **上下文长度档位** — 窗口长度落在档位值的 **±5%** 内即算同一档（例如档位 `256K = 262144`，则 `249,037 ~ 275,251` 都命中；多档重叠时取最近的一档）
 3. **模型** — 精确的 `provider/model`
 
-覆盖是**按策略项**进行的：上层只覆盖它写了的项，其余项继续从下层继承。所以可以让「全局开 80%」+「256K 档再加 W−32K」+「某个模型单独把比例改成 0.7」。
+每一层都是**完整选择**：四个项各自只有「启用 / 停用」，没有「继承」。高层一旦存在就整体覆盖低层，所以「档位层」或「模型层」里关掉的项不会从全局层漏回来。
 
-## 三个策略项
+> 为了不让你因为这条规则踩坑，界面里**新增**档位/模型覆盖时会以「当前继承到的策略」作为起点（新增档位复制全局策略，新增模型复制该模型当前生效的策略），而不是一上来把四项全关掉。
 
-每个项都可以独立启用/停用，取值自定义；最终阈值取**已启用项的最小值再向下取整**：
+## 四个策略项
+
+每个项都可以独立启用/停用，取值自定义；最终阈值取**已启用项的最小值再向下取整**，其中 `absolute` 是覆盖规则的例外：
 
 | 项 | 公式 | 含义 |
 |---|---|---|
 | `ratio` | `W × v` | 上下文的比例（`0 < v < 1`） |
 | `outputAware` | `W − O − v` | 扣掉该路由的输出预留 `O` 和固定值 `v` |
 | `fixed` | `W − v` | 只扣固定值 |
+| `absolute` | `v` | 硬编码阈值：**`v < W` 时直接覆盖另外三项**；`v ≥ W` 时永不触发，被忽略并在预览处给出提醒 |
 
 没有启用任何项时，插件完全不介入，继续使用官方内置阈值。
 
@@ -74,9 +81,10 @@ dsh plugin --profile <profile> add link:/path/to/dsh-compact-manager
 
 打开侧边栏的「压缩策略」页：
 
-- **模型下拉**：选择任意一个已知路由，右上角显示它的 `W`、`O`、**当前生效阈值**、官方内置阈值，以及各启用项的取值和决定项。
-- **预设**：一键套用常见策略（含 `256K 档：80% 或 上下文−32K`）。
-- **全局 / 档位 / 模型策略**：勾选并填写策略项；档位可增删，模型的 provider/model 可直接填写。
+- **模型下拉**：选择任意一个已知路由，页面显示它的 `W`、`O`、**当前生效阈值**、官方内置阈值，以及各启用项的取值和决定项。
+- **预设**：一键套用常见策略（含 `256K 档：80% 或 上下文−32K`、`256K 档：硬编码阈值 209,715`）。
+- **全局 / 档位 / 模型策略**：每个项都只是一个「启用 / 停用」开关加一个数值；档位可增删，模型覆盖的 provider/model 用下拉列表选择。
+- **提醒**：当 `absolute` 的值 ≥ 上下文窗口 W（永远不会触发）时，或当 `outputAware` 因为 `O` 过大而主导阈值时，预览区会直接给出黄色提示。
 - **保存**：写回宿主并持久化；页面每 5 秒、窗口获得焦点时自动刷新，所以「实时看到阈值」不需要手动刷。
 
 ## 工作原理
@@ -95,16 +103,38 @@ dsh plugin --profile <profile> add link:/path/to/dsh-compact-manager
 
 ## 策略文档格式
 
+每一层都是完整选择：四项必须各自表态，所以持久化的文档里每层都长这样（未提到的项按「停用 + 默认值」补齐）：
+
 ```json
 {
   "global": {
-    "ratio": { "enabled": true, "value": 0.8 }
+    "ratio":        { "enabled": true,  "value": 0.8 },
+    "outputAware":  { "enabled": false, "value": 32768 },
+    "fixed":        { "enabled": false, "value": 32768 },
+    "absolute":     { "enabled": false, "value": 131072 }
   },
   "tiers": [
-    { "window": 262144, "policy": { "fixed": { "enabled": true, "value": 32768 } } }
+    {
+      "window": 262144,
+      "policy": {
+        "ratio":       { "enabled": true,  "value": 0.8 },
+        "outputAware": { "enabled": false, "value": 32768 },
+        "fixed":       { "enabled": true,  "value": 32768 },
+        "absolute":    { "enabled": false, "value": 131072 }
+      }
+    }
   ],
   "models": [
-    { "provider": "kimi-coding", "model": "k3-256k", "policy": { "ratio": { "enabled": true, "value": 0.7 } } }
+    {
+      "provider": "kimi-coding",
+      "model": "k3-256k",
+      "policy": {
+        "ratio":       { "enabled": true,  "value": 0.7 },
+        "outputAware": { "enabled": false, "value": 32768 },
+        "fixed":       { "enabled": false, "value": 32768 },
+        "absolute":    { "enabled": false, "value": 131072 }
+      }
+    }
   ]
 }
 ```
@@ -129,7 +159,7 @@ lib/client.js    浏览器插件
 - 只覆盖**压力触发**；上下文溢出恢复（`context-overflow`）仍走官方路径。
 - 只改变触发阈值，不改变一次压缩的保留比例。
 - 原型钩子作用于**所有会话**（策略本身就是进程级配置）。引擎模块被热替换后会重新导入并再次挂钩；若宿主改用不继承该原型的自定义压缩后端，钩子不会生效（宿主日志会给出告警）。
-- 模型下拉来自 `ctx.llm.listProviders()` × `listModels()`；不公开目录的 provider（例如某些账号型 provider 未登录时）不会出现在列表里，可直接在「模型策略」里手填 provider/model。
+- 模型下拉来自 `ctx.llm.listProviders()` × `listModels()`；不公开目录的 provider（例如某些账号型 provider 未登录时）不会出现在列表里，也就无法为它新增覆盖（已经存在的条目仍会保留并显示）。
 - 页面数据来自宿主自有路由，因此不受 dsh 的 Remote 事件白名单限制，但也因此不会收到推送，只能轮询/聚焦刷新。
 - 与任何同样装饰 `compactIfNeeded` 的插件（例如本仓库同作者早期的 `compaction-threshold-override`）功能重叠，建议只保留一个。
 

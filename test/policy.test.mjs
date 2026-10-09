@@ -2,6 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  ITEM_FALLBACK,
+  POLICY_ITEMS,
   builtinThreshold,
   computeThreshold,
   defaultDocument,
@@ -22,6 +24,7 @@ test('an empty document leaves every route on the built-in policy', () => {
   assert.equal(row.threshold, null)
   assert.equal(row.winner, null)
   assert.deepEqual(row.candidates, [])
+  assert.equal(row.absoluteIgnored, false)
   assert.equal(row.builtin, 65536)
 })
 
@@ -49,29 +52,46 @@ test('the closest tier wins when several bands overlap', () => {
   assert.equal(matchTier(tiers, 260_000)?.window, 262_144)
 })
 
-test('later layers override item by item', () => {
+test('normalization materializes every item as an explicit on/off choice', () => {
+  const document = normalizeDocument({ global: { ratio: { enabled: true, value: 0.8 } } })
+  assert.deepEqual(Object.keys(document.global).sort(), [...POLICY_ITEMS].sort())
+  assert.deepEqual(document.global.ratio, { enabled: true, value: 0.8 })
+  assert.deepEqual(document.global.outputAware, { enabled: false, value: ITEM_FALLBACK.outputAware })
+  assert.deepEqual(document.global.fixed, { enabled: false, value: ITEM_FALLBACK.fixed })
+  assert.deepEqual(document.global.absolute, { enabled: false, value: ITEM_FALLBACK.absolute })
+})
+
+test('a higher layer replaces the layer below instead of inheriting from it', () => {
+  // The tier states ratio only, so the global ratio is replaced by the tier's
+  // own decision and every other item stays off at that tier.
   const document = normalizeDocument({
-    global: { ratio: { enabled: true, value: 0.8 }, fixed: { enabled: false, value: 1024 } },
-    tiers: [{ window: W256, policy: { fixed: { enabled: true, value: 32768 } } }],
-    models: [{ provider: 'kimi-coding', model: 'k3-256k', policy: { ratio: { enabled: true, value: 0.7 } } }],
+    global: { ratio: { enabled: true, value: 0.8 } },
+    tiers: [{ window: W256, policy: { ratio: { enabled: true, value: 0.7 } } }],
   })
   const { items, layers } = resolvePolicy(document, { provider: 'kimi-coding', model: 'k3-256k' }, W256)
   assert.equal(items.ratio.value, 0.7)
   assert.equal(items.ratio.enabled, true)
-  assert.equal(items.fixed.value, 32768)
-  assert.equal(items.fixed.enabled, true)
-  assert.equal(items.outputAware, undefined)
-  assert.deepEqual(layers, { global: true, tier: W256, model: true })
+  assert.equal(items.fixed.enabled, false)
+  assert.deepEqual(layers, { global: true, tier: W256, model: false })
+  assert.equal(resolveRow(document, { provider: 'kimi-coding', model: 'k3-256k' }, W256, O128).threshold, 183_500)
 })
 
-test('a model layer inherits the items it does not mention', () => {
+test('a tier can switch off an item the global layer enabled', () => {
+  // The trap this guards: a global `outputAware` item crushes the threshold on a
+  // route with a large output reservation.
   const document = normalizeDocument({
-    global: { ratio: { enabled: true, value: 0.8 } },
-    models: [{ provider: 'p', model: 'm', policy: { fixed: { enabled: true, value: 32768 } } }],
+    global: { ratio: { enabled: true, value: 0.8 }, outputAware: { enabled: true, value: 32768 } },
+    tiers: [{ window: W256, policy: { ratio: { enabled: true, value: 0.8 } } }],
   })
-  const { items } = resolvePolicy(document, { provider: 'p', model: 'm' }, 1_000_000)
-  assert.equal(items.ratio.value, 0.8)
-  assert.equal(items.fixed.value, 32768)
+  const row = resolveRow(document, { provider: 'kimi-coding', model: 'k3-256k' }, W256, O128)
+  assert.equal(row.threshold, 209_715)
+  assert.equal(row.winner, 'ratio')
+  assert.deepEqual(row.candidates.map((candidate) => candidate.item), ['ratio'])
+
+  // Without the tier the dangerous item still dominates.
+  const inherited = resolveRow({ ...document, tiers: [] }, { provider: 'kimi-coding', model: 'k3-256k' }, W256, O128)
+  assert.equal(inherited.threshold, 98_304)
+  assert.equal(inherited.winner, 'outputAware')
 })
 
 test('the threshold is the floored minimum of the enabled items', () => {
@@ -79,6 +99,7 @@ test('the threshold is the floored minimum of the enabled items', () => {
     ratio: { enabled: true, value: 0.8 },
     fixed: { enabled: true, value: 32768 },
     outputAware: { enabled: false, value: 0 },
+    absolute: { enabled: false, value: 0 },
   }
   const result = computeThreshold(merged, W256, O128)
   assert.equal(result.threshold, 209_715) // floor(262144 * 0.8)
@@ -99,6 +120,44 @@ test('the output-aware item subtracts the routed reservation', () => {
   assert.equal(result.winner, 'outputAware')
 })
 
+test('an absolute threshold below the window overrides the other three', () => {
+  const items = {
+    ratio: { enabled: true, value: 0.8 },
+    outputAware: { enabled: true, value: 32768 },
+    fixed: { enabled: true, value: 32768 },
+    absolute: { enabled: true, value: 150_000 },
+  }
+  const result = computeThreshold(items, W256, O128)
+  // 150000 is larger than the smallest of the others (98304) yet still wins: the
+  // absolute item is an override, not another candidate in the minimum.
+  assert.equal(result.threshold, 150_000)
+  assert.equal(result.winner, 'absolute')
+  assert.deepEqual(result.candidates, [{ item: 'absolute', value: 150_000 }])
+  assert.equal(result.absoluteIgnored, false)
+})
+
+test('an absolute threshold at or above the window is ignored and reported', () => {
+  const ignored = computeThreshold({
+    ratio: { enabled: true, value: 0.8 },
+    absolute: { enabled: true, value: W256 },
+  }, W256, O128)
+  assert.equal(ignored.threshold, 209_715)
+  assert.equal(ignored.winner, 'ratio')
+  assert.equal(ignored.absoluteIgnored, true)
+
+  // Nothing else enabled: the override is still reported as ignored rather than
+  // silently deciding something.
+  const alone = computeThreshold({ absolute: { enabled: true, value: W256 + 1 } }, W256, O128)
+  assert.equal(alone.threshold, null)
+  assert.equal(alone.absoluteIgnored, true)
+
+  const row = resolveRow(normalizeDocument({
+    global: { absolute: { enabled: true, value: 999_999 } },
+  }), { provider: 'p', model: 'm' }, W256, O128)
+  assert.equal(row.threshold, null)
+  assert.equal(row.absoluteIgnored, true)
+})
+
 test('an item that never enables is ignored, and impossible results are refused', () => {
   assert.equal(computeThreshold({ ratio: { enabled: false, value: 0.8 } }, W256, O128), undefined)
   assert.equal(computeThreshold({}, W256, O128), undefined)
@@ -106,32 +165,10 @@ test('an item that never enables is ignored, and impossible results are refused'
   assert.equal(computeThreshold({ ratio: { enabled: true, value: 0.8 } }, undefined, 0), undefined)
 })
 
-test('a higher layer can switch off an item the lower layer enabled', () => {
-  // The trap this guards: a global `outputAware` item crushes the threshold on a
-  // route with a large output reservation, and an unchecked box in the tier
-  // layer used to mean "inherit" rather than "off".
-  const document = normalizeDocument({
-    global: {
-      ratio: { enabled: true, value: 0.8 },
-      outputAware: { enabled: true, value: 32768 },
-    },
-    tiers: [{ window: W256, policy: { outputAware: { enabled: false, value: 32768 } } }],
-  })
-  const disabled = resolveRow(document, { provider: 'kimi-coding', model: 'k3-256k' }, W256, O128)
-  assert.equal(disabled.threshold, 209_715) // outputAware is off, ratio wins
-  assert.equal(disabled.winner, 'ratio')
-  assert.deepEqual(disabled.candidates.map((candidate) => candidate.item), ['ratio'])
-
-  // Without the tier override the dangerous item still dominates.
-  const inherited = resolveRow({ ...document, tiers: [] }, { provider: 'kimi-coding', model: 'k3-256k' }, W256, O128)
-  assert.equal(inherited.threshold, 98_304)
-  assert.equal(inherited.winner, 'outputAware')
-})
-
-test('the 256K rescue preset resolves to the requested formula', () => {
+test('the recommended 256K preset resolves to the requested formula', () => {
   const document = normalizeDocument({
     global: { ratio: { enabled: true, value: 0.8 } },
-    tiers: [{ window: W256, policy: { fixed: { enabled: true, value: 32768 } } }],
+    tiers: [{ window: W256, policy: { ratio: { enabled: true, value: 0.8 }, fixed: { enabled: true, value: 32768 } } }],
   })
   const row = resolveRow(document, { provider: 'kimi-coding', model: 'k3-256k' }, W256, O128)
   // floor(min(262144 × 0.8, 262144 − 32768)) = 209715, versus the built-in 65536
@@ -151,14 +188,13 @@ test('normalization keeps valid entries and drops junk', () => {
     tiers: [{ window: W256, policy: {} }, { window: -1 }, 'nope'],
     models: [{ provider: 'p', model: 'm', policy: {} }, { provider: '', model: 'm' }],
   })
-  assert.deepEqual(Object.keys(document.global), ['ratio'])
+  assert.equal(document.global.ratio.enabled, true)
+  assert.equal(document.global.fixed.enabled, false)
+  assert.equal(document.global.fixed.value, ITEM_FALLBACK.fixed)
+  assert.equal(document.global.bogus, undefined)
   assert.equal(document.tiers.length, 1)
   assert.equal(document.models.length, 1)
-  assert.deepEqual(document, {
-    global: { ratio: { enabled: true, value: 0.8 } },
-    tiers: [{ window: W256, policy: {} }],
-    models: [{ provider: 'p', model: 'm', policy: {} }],
-  })
+  assert.deepEqual(Object.keys(document.tiers[0].policy).sort(), [...POLICY_ITEMS].sort())
 })
 
 test('validation reports every structural problem it can see', () => {
@@ -166,7 +202,11 @@ test('validation reports every structural problem it can see', () => {
   assert.deepEqual(validateDocument({}), [])
 
   const issues = validateDocument({
-    global: { ratio: { enabled: true, value: 1.4 }, unknown: { enabled: true, value: 1 } },
+    global: {
+      ratio: { enabled: true, value: 1.4 },
+      absolute: { enabled: true, value: 0 },
+      unknown: { enabled: true, value: 1 },
+    },
     tiers: [{ window: W256 }, { window: W256 }, { window: 0 }],
     models: [
       { provider: 'p', model: 'm', policy: {} },
@@ -179,6 +219,7 @@ test('validation reports every structural problem it can see', () => {
   assert.match(joined, /unknown keys: extra/)
   assert.match(joined, /global\.unknown is not a known item/)
   assert.match(joined, /ratio\.value must be greater than 0 and less than 1/)
+  assert.match(joined, /absolute\.value must be a positive token count/)
   assert.match(joined, /tiers\[1\]\.window duplicates/)
   assert.match(joined, /tiers\[2\]\.window must be a positive integer/)
   assert.match(joined, /models\[1\] duplicates p\/m/)
@@ -187,7 +228,7 @@ test('validation reports every structural problem it can see', () => {
 
 test('validation accepts a well-formed document', () => {
   assert.deepEqual(validateDocument({
-    global: { ratio: { enabled: true, value: 0.8 } },
+    global: { ratio: { enabled: true, value: 0.8 }, absolute: { enabled: false, value: 131072 } },
     tiers: [{ window: W256, policy: { fixed: { enabled: true, value: 32768 } } }],
     models: [{ provider: 'kimi-coding', model: 'k3-256k', policy: { outputAware: { enabled: true, value: 4096 } } }],
   }), [])

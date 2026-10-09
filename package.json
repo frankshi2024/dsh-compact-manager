@@ -20,6 +20,7 @@
     "lib/schema.js",
     "cordis.patch.yml",
     "icon.svg",
+    "kimi-quarter.jpg",
     "locale/*.json",
     "README.md",
     "LICENSE"
