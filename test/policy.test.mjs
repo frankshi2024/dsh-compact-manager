@@ -152,7 +152,8 @@ test('an absolute threshold at or above the window is ignored and reported', () 
   assert.equal(alone.absoluteIgnored, true)
 
   const row = resolveRow(normalizeDocument({
-    global: { absolute: { enabled: true, value: 999_999 } },
+    global: { ratio: { enabled: true, value: 0.8 } },
+    models: [{ provider: 'p', model: 'm', policy: { absolute: { enabled: true, value: 999_999 } } }],
   }), { provider: 'p', model: 'm' }, W256, O128)
   assert.equal(row.threshold, null)
   assert.equal(row.absoluteIgnored, true)
@@ -180,6 +181,24 @@ test('the recommended 256K preset resolves to the requested formula', () => {
   const wide = resolveRow(document, { provider: 'deepseek-official', model: 'deepseek-flash' }, 1_000_000, 256_000)
   assert.equal(wide.threshold, 800_000)
   assert.equal(wide.layers.tier, null)
+})
+
+test('the global layer never carries an absolute threshold', () => {
+  // The global layer has no window to compare a hard-coded value against, so an
+  // enabled one is ignored by resolution and rejected by validation.
+  const document = normalizeDocument({
+    global: { absolute: { enabled: true, value: 150_000 }, ratio: { enabled: true, value: 0.8 } },
+  })
+  const { items } = resolvePolicy(document, { provider: 'p', model: 'm' }, W256)
+  assert.equal(items.absolute, undefined)
+  const row = resolveRow(document, { provider: 'p', model: 'm' }, W256, O128)
+  assert.equal(row.threshold, 209_715)
+  assert.equal(row.winner, 'ratio')
+  assert.deepEqual(validateDocument({ global: { absolute: { enabled: true, value: 150_000 } } }), [
+    'global.absolute is not allowed: a hard-coded threshold belongs to a tier or model layer',
+  ])
+  // A switched-off entry is inert, so it stays acceptable.
+  assert.deepEqual(validateDocument({ global: { absolute: { enabled: false, value: 150_000 } } }), [])
 })
 
 test('normalization keeps valid entries and drops junk', () => {
