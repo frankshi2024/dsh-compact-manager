@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Compaction threshold manager",
+    "description": "Layered compaction thresholds: global, context-window tier, and per-model policies with a live sidebar editor."
+  }
+}

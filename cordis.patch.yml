@@ -1,0 +1,9 @@
+# dsh-compact-manager bundle patch for DeepSeek Harness.
+#
+# One host row owns the persisted policy document, serves the browser half over
+# `/api/compact-manager/*`, and overrides the mounted compaction engine's
+# pressure trigger. The browser row is discovered from this package's
+# `dsh.client` declaration plus its `./client` export.
+- insert:
+    - id: compact-manager
+      name: 'dsh-compact-manager'
