@@ -106,6 +106,28 @@ test('an item that never enables is ignored, and impossible results are refused'
   assert.equal(computeThreshold({ ratio: { enabled: true, value: 0.8 } }, undefined, 0), undefined)
 })
 
+test('a higher layer can switch off an item the lower layer enabled', () => {
+  // The trap this guards: a global `outputAware` item crushes the threshold on a
+  // route with a large output reservation, and an unchecked box in the tier
+  // layer used to mean "inherit" rather than "off".
+  const document = normalizeDocument({
+    global: {
+      ratio: { enabled: true, value: 0.8 },
+      outputAware: { enabled: true, value: 32768 },
+    },
+    tiers: [{ window: W256, policy: { outputAware: { enabled: false, value: 32768 } } }],
+  })
+  const disabled = resolveRow(document, { provider: 'kimi-coding', model: 'k3-256k' }, W256, O128)
+  assert.equal(disabled.threshold, 209_715) // outputAware is off, ratio wins
+  assert.equal(disabled.winner, 'ratio')
+  assert.deepEqual(disabled.candidates.map((candidate) => candidate.item), ['ratio'])
+
+  // Without the tier override the dangerous item still dominates.
+  const inherited = resolveRow({ ...document, tiers: [] }, { provider: 'kimi-coding', model: 'k3-256k' }, W256, O128)
+  assert.equal(inherited.threshold, 98_304)
+  assert.equal(inherited.winner, 'outputAware')
+})
+
 test('the 256K rescue preset resolves to the requested formula', () => {
   const document = normalizeDocument({
     global: { ratio: { enabled: true, value: 0.8 } },
