@@ -40,5 +40,17 @@ test('the host half declares the services it uses', async () => {
   const source = await readFile(new URL('index.js', LIB), 'utf8')
   assert.match(source, /export const inject = \['storageDomain', 'connection', 'llm'\]/)
   assert.match(source, /export const name = 'compact-manager'/)
-  assert.match(source, /ctx\.inject\(\['compaction', 'tokenMeter'\]/)
+  // The shipped Web composition keeps compaction on the per-preset plane, so the
+  // hook decorates the exported class prototype instead of injecting the service.
+  assert.match(source, /import\('@deepseek-ai\/dsh-compaction-basic'\)/)
+  assert.match(source, /prototype\.compactIfNeeded = patched/)
+  assert.doesNotMatch(source, /ctx\.inject\(\['compaction'/)
+})
+
+test('the host half patches the prototype without breaking the overflow path', async () => {
+  const source = await readFile(new URL('index.js', LIB), 'utf8')
+  assert.match(source, /if \(trigger === 'pressure'\)/)
+  assert.match(source, /return previous\.call\(this, agent, trigger, signal\)/)
+  // A shared marker keeps reloaded module instances from stacking wrappers.
+  assert.match(source, /Symbol\.for\('dsh\.compact-manager\.hook'\)/)
 })

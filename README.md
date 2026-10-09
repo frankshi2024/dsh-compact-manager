@@ -66,7 +66,9 @@ dsh plugin --profile <profile> add dsh-compact-manager
 dsh plugin --profile <profile> add link:/path/to/dsh-compact-manager
 ```
 
-安装后需要在**侧边栏**出现「压缩策略」页面；新增插件行在部分部署里需要重启 dsh 才会挂载。
+安装后侧边栏会出现「压缩策略」页面。通过 `plugin_manager` / `dsh plugin` 安装通常即时生效；若侧边栏没有出现，先刷新浏览器页面，再考虑重启 dsh。
+
+> 本地 `link:` 安装不会自动安装被链接包自己的依赖，请在插件仓库里先执行一次 `pnpm install`（本插件需要 `zod`）。
 
 ## 侧边栏用法
 
@@ -79,9 +81,10 @@ dsh plugin --profile <profile> add link:/path/to/dsh-compact-manager
 
 ## 工作原理
 
-- **宿主半**（`lib/index.js`）：把策略文档存进 `ctx.storageDomain`（域名 `compact_manager`，json 后端落在 `$DSH_HOME/storages/`），通过两条自有 `/api/compact-manager/*` Fetch 路由给浏览器半读写，并装饰已挂载的 compaction 引擎实例的 `compactIfNeeded`：压力达到策略阈值时就交回内置后端，否则直接返回「不压缩」。
-- **浏览器半**（`lib/client.js`）：手写的 `window.__ModuleLoader__.load(...)` 经典脚本（第三方插件无法向页面推送自定义事件，因此采用「自行侦听 + 轮询」）。
-- 引擎被替换或卸载时，宿主半边通过 Cordis effect 还原原方法。
+- **宿主半**（`lib/index.js`）：把策略文档存进 `ctx.storageDomain`（域名 `compact_manager`，json 后端落在 `$DSH_HOME/storages/`），并通过两条自有 `/api/compact-manager/*` Fetch 路由给浏览器半读写。
+- **阈值钩子**：Web 组合把压缩放在**每个 agent preset 的隔离作用域**里（`dsh-web-app` 停用了 profile 层的 `compaction-basic`，preset 内以 `isolate: { compaction: true }` 各挂一份），因此 profile 层的插件注入不到 `ctx.compaction`。本插件改为装饰 `@deepseek-ai/dsh-compaction-basic` 导出类的原型方法 `compactIfNeeded`：压力达到策略阈值就交回内置实现，否则直接返回「不压缩」。这样无论引擎实例在哪个作用域都能生效，`context-overflow` 恢复路径保持原样。
+- **浏览器半**（`lib/client.js`）：手写的 `window.__ModuleLoader__.load(...)` 经典脚本。第三方插件无法向页面推送自定义事件（转发事件白名单是构建期固定的），因此采用「自行轮询 + 窗口聚焦刷新」。
+- 引擎被替换或卸载时，宿主半边通过 Cordis effect 还原原型方法。
 
 ### HTTP API
 
@@ -125,6 +128,7 @@ lib/client.js    浏览器插件
 
 - 只覆盖**压力触发**；上下文溢出恢复（`context-overflow`）仍走官方路径。
 - 只改变触发阈值，不改变一次压缩的保留比例。
+- 原型钩子作用于**所有会话**（策略本身就是进程级配置）。引擎模块被热替换后会重新导入并再次挂钩；若宿主改用不继承该原型的自定义压缩后端，钩子不会生效（宿主日志会给出告警）。
 - 模型下拉来自 `ctx.llm.listProviders()` × `listModels()`；不公开目录的 provider（例如某些账号型 provider 未登录时）不会出现在列表里，可直接在「模型策略」里手填 provider/model。
 - 页面数据来自宿主自有路由，因此不受 dsh 的 Remote 事件白名单限制，但也因此不会收到推送，只能轮询/聚焦刷新。
 - 与任何同样装饰 `compactIfNeeded` 的插件（例如本仓库同作者早期的 `compaction-threshold-override`）功能重叠，建议只保留一个。
